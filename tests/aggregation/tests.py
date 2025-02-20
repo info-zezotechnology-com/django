@@ -25,6 +25,7 @@ from django.db.models import (
     Subquery,
     Sum,
     TimeField,
+    Transform,
     Value,
     Variance,
     When,
@@ -1275,6 +1276,8 @@ class AggregateTestCase(TestCase):
             Book.objects.annotate(Max("id")).annotate(Sum("id__max"))
 
         class MyMax(Max):
+            arity = None
+
             def as_sql(self, compiler, connection):
                 self.set_source_expressions(self.get_source_expressions()[0:1])
                 return super().as_sql(compiler, connection)
@@ -1287,10 +1290,11 @@ class AggregateTestCase(TestCase):
     def test_multi_arg_aggregate(self):
         class MyMax(Max):
             output_field = DecimalField()
+            arity = None
 
             def as_sql(self, compiler, connection):
                 copy = self.copy()
-                copy.set_source_expressions(copy.get_source_expressions()[0:1])
+                copy.set_source_expressions(copy.get_source_expressions()[0:1] + [None])
                 return super(MyMax, copy).as_sql(compiler, connection)
 
         with self.assertRaisesMessage(TypeError, "Complex aggregates require an alias"):
@@ -1727,6 +1731,48 @@ class AggregateTestCase(TestCase):
             ordered=False,
         )
 
+    def test_order_by_aggregate_transform(self):
+        class Mod100(Mod, Transform):
+            def __init__(self, expr):
+                super().__init__(expr, 100)
+
+        sum_field = IntegerField()
+        sum_field.register_lookup(Mod100, "mod100")
+        publisher_pages = (
+            Book.objects.values("publisher")
+            .annotate(sum_pages=Sum("pages", output_field=sum_field))
+            .order_by("sum_pages__mod100")
+        )
+        self.assertQuerySetEqual(
+            publisher_pages,
+            [
+                {"publisher": self.p2.id, "sum_pages": 528},
+                {"publisher": self.p4.id, "sum_pages": 946},
+                {"publisher": self.p1.id, "sum_pages": 747},
+                {"publisher": self.p3.id, "sum_pages": 1482},
+            ],
+        )
+
+    def test_order_by_aggregate_default_alias(self):
+        publisher_books = (
+            Publisher.objects.values("book")
+            .annotate(Count("book"))
+            .order_by("book__count", "book__id")
+            .values_list("book", flat=True)
+        )
+        self.assertQuerySetEqual(
+            publisher_books,
+            [
+                None,
+                self.b1.id,
+                self.b2.id,
+                self.b3.id,
+                self.b4.id,
+                self.b5.id,
+                self.b6.id,
+            ],
+        )
+
     def test_empty_result_optimization(self):
         with self.assertNumQueries(0):
             self.assertEqual(
@@ -1886,7 +1932,7 @@ class AggregateTestCase(TestCase):
         )
 
     def test_aggregation_default_using_time_from_database(self):
-        now = timezone.now().astimezone(datetime.timezone.utc)
+        now = timezone.now().astimezone(datetime.UTC)
         expr = Min(
             "store__friday_night_closing",
             filter=~Q(store__name="Amazon.com"),
@@ -1938,7 +1984,7 @@ class AggregateTestCase(TestCase):
         )
 
     def test_aggregation_default_using_date_from_database(self):
-        now = timezone.now().astimezone(datetime.timezone.utc)
+        now = timezone.now().astimezone(datetime.UTC)
         expr = Min("book__pubdate", default=TruncDate(NowUTC()))
         queryset = Publisher.objects.annotate(earliest_pubdate=expr).order_by("name")
         self.assertSequenceEqual(
@@ -1999,7 +2045,7 @@ class AggregateTestCase(TestCase):
         )
 
     def test_aggregation_default_using_datetime_from_database(self):
-        now = timezone.now().astimezone(datetime.timezone.utc)
+        now = timezone.now().astimezone(datetime.UTC)
         expr = Min(
             "store__original_opening",
             filter=~Q(store__name="Amazon.com"),
@@ -2134,6 +2180,27 @@ class AggregateTestCase(TestCase):
             .values_list("sum", flat=True)
         )
         self.assertEqual(list(author_qs), [337])
+
+    def test_aggregate_arity(self):
+        funcs_with_inherited_constructors = [Avg, Max, Min, Sum]
+        msg = "takes exactly 1 argument (2 given)"
+        for function in funcs_with_inherited_constructors:
+            with (
+                self.subTest(function=function),
+                self.assertRaisesMessage(TypeError, msg),
+            ):
+                function(Value(1), Value(2))
+
+        funcs_with_custom_constructors = [Count, StdDev, Variance]
+        for function in funcs_with_custom_constructors:
+            with self.subTest(function=function):
+                # Extra arguments are rejected via the constructor.
+                with self.assertRaises(TypeError):
+                    function(Value(1), True, Value(2))
+                # If the constructor is skipped, the arity check runs.
+                func_instance = function(Value(1), True)
+                with self.assertRaisesMessage(TypeError, msg):
+                    super(function, func_instance).__init__(Value(1), Value(2))
 
 
 class AggregateAnnotationPruningTests(TestCase):
@@ -2321,3 +2388,19 @@ class AggregateAnnotationPruningTests(TestCase):
             max_book_author=Max("book__authors"),
         ).aggregate(count=Count("id", filter=Q(id__in=[F("max_book_author"), 0])))
         self.assertEqual(aggregates, {"count": 1})
+
+    @skipUnlessDBFeature("supports_select_union")
+    def test_aggregate_combined_queries(self):
+        # Combined queries could have members in their values select mask while
+        # others have them in their annotation mask which makes annotation
+        # pruning complex to implement hence why it's not implemented.
+        qs = Author.objects.values(
+            "age",
+            other=Value(0),
+        ).union(
+            Book.objects.values(
+                age=Value(0),
+                other=Value(0),
+            )
+        )
+        self.assertEqual(qs.count(), 3)

@@ -2,7 +2,7 @@
 Django 4.2.8 release notes
 ==========================
 
-*Expected December 4, 2023*
+*December 4, 2023*
 
 Django 4.2.8 fixes several bugs in 4.2.7 and adds compatibility with Python
 3.12.
@@ -35,3 +35,6 @@ Bugfixes
 * Fixed a regression in Django 4.2 where the admin's read-only password widget
   and some help texts were incorrectly aligned at tablet widths
   (:ticket:`34982`).
+
+* Fixed a regression in Django 4.2 that caused a migration crash on SQLite when
+  altering unsupported ``Meta.db_table_comment`` (:ticket:`35006`).
